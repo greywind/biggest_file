@@ -1,3 +1,5 @@
+mod biggest_file_searcher;
+
 use std::fs;
 
 #[tokio::main]
@@ -16,4 +18,6 @@ async fn main() {
     }
 
     println!("I'll find the biggest file in {}!", path);
+    let result = biggest_file_searcher::find_the_biggest_file(path.to_string()).await.expect("Error finding the biggest file");
+    println!("The biggest file is: '{}' with size: {} bytes", result.path, result.size);
 }
