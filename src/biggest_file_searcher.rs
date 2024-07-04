@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::ops::Deref;
 use std::path::PathBuf;
 
@@ -17,20 +16,36 @@ pub async fn find_the_biggest_file(path: String) -> Result<FileSize, Box<dyn std
 }
 
 struct BiggestFileSearcher {
-    paths_to_check: VecDeque<PathBuf>,
+    paths_tx: async_channel::Sender<PathBuf>,
+    paths_rx: async_channel::Receiver<PathBuf>,
     biggest_file: Option<FileSize>,
+    counter: usize,
 }
 
 impl BiggestFileSearcher {
+    const BUFFER_SIZE: usize = 100;
     fn new(path: String) -> Self {
-        Self {
-            paths_to_check: VecDeque::from([PathBuf::from(path)]),
+        let (paths_tx, paths_rx) = async_channel::bounded(BiggestFileSearcher::BUFFER_SIZE);
+        let mut result = Self {
+            paths_tx,
+            paths_rx,
             biggest_file: None,
-        }
+            counter: 0,
+        };
+        let path = PathBuf::from(path);
+        result.add_path_to_search(path);
+        result
+    }
+
+    fn add_path_to_search(&mut self, path: PathBuf) {
+        let paths_tx = self.paths_tx.clone();
+        self.counter += 1;
+        tokio::spawn( async move { paths_tx.send(path).await });
     }
 
     async fn find_the_biggest_file(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        while let Some(path) = self.paths_to_check.pop_front() {
+        while let Ok(path) = self.paths_rx.recv().await {
+            self.counter -= 1;
             let mut read_dir = tokio::fs::read_dir(path.deref()).await?;
             loop {
                 let entry = read_dir.next_entry().await?;
@@ -41,7 +56,7 @@ impl BiggestFileSearcher {
 
                 let file_type = entry.file_type().await?;
                 if file_type.is_dir() {
-                    self.paths_to_check.push_back(entry.path());
+                    self.add_path_to_search(entry.path());
                     continue;
                 }
 
@@ -52,6 +67,9 @@ impl BiggestFileSearcher {
                         path: entry.path().to_str().unwrap().to_string(),
                     });
                 }
+            }
+            if self.counter == 0 {
+                break;
             }
         }
 
