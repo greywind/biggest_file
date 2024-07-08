@@ -1,18 +1,26 @@
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::{Arc};
-use tokio::sync::{mpsc, RwLock, Mutex};
+use std::sync::Arc;
+
+use tokio::sync::{mpsc, Mutex, RwLock};
+
+use crate::biggest_file_searcher::FileSizeMessage::{FileSize, Finished};
 
 #[derive(Clone)]
-pub struct FileSize {
+pub struct FileSizeStruct {
     pub path: String,
     pub size: u64,
 }
 
-pub async fn find_the_biggest_file(path: String) -> Result<FileSize, Box<dyn std::error::Error>> {
+enum FileSizeMessage {
+    FileSize(FileSizeStruct),
+    Finished,
+}
+
+pub async fn find_the_biggest_file(path: String) -> Result<FileSizeStruct, Box<dyn std::error::Error>> {
     let mut searcher = BiggestFileSearcher::new();
     searcher.receive_file_size().await;
-    searcher.find_the_biggest_file(path).await?;
+    searcher.find_the_biggest_file(path).await;
     match searcher.biggest_file().await {
         Some(file_size) => Ok(file_size),
         None => Err("No files found".into()),
@@ -22,10 +30,11 @@ pub async fn find_the_biggest_file(path: String) -> Result<FileSize, Box<dyn std
 struct BiggestFileSearcherImpl {
     paths_tx: async_channel::Sender<PathBuf>,
     paths_rx: async_channel::Receiver<PathBuf>,
-    file_size_tx: mpsc::Sender<FileSize>,
-    file_size_rx: Arc<Mutex<mpsc::Receiver<FileSize>>>,
+    file_size_tx: mpsc::Sender<FileSizeMessage>,
+    file_size_rx: Arc<Mutex<mpsc::Receiver<FileSizeMessage>>>,
     counter_tx: mpsc::Sender<isize>,
-    biggest_file: Arc<Mutex<Option<FileSize>>>,
+    counter_rx: Arc<Mutex<mpsc::Receiver<isize>>>,
+    biggest_file: Arc<Mutex<Option<FileSizeStruct>>>,
 }
 
 struct BiggestFileSearcher {
@@ -33,20 +42,20 @@ struct BiggestFileSearcher {
 }
 
 impl BiggestFileSearcherImpl {
-    const BUFFER_SIZE: usize = 100;
+    const MAX_DOP: usize = 10;
     fn new() -> Self {
         let (paths_tx, paths_rx) = async_channel::unbounded();
-        let (file_size_tx, file_size_rx) = mpsc::channel(BiggestFileSearcherImpl::BUFFER_SIZE);
-        let (counter_tx, counter_rx) = mpsc::channel(BiggestFileSearcherImpl::BUFFER_SIZE);
+        let (file_size_tx, file_size_rx) = mpsc::channel(BiggestFileSearcherImpl::MAX_DOP);
+        let (counter_tx, counter_rx) = mpsc::channel(BiggestFileSearcherImpl::MAX_DOP + 1);
         let result = Self {
             paths_tx,
             paths_rx,
             file_size_tx,
             file_size_rx: Arc::new(Mutex::new(file_size_rx)),
             counter_tx,
+            counter_rx: Arc::new(Mutex::new(counter_rx)),
             biggest_file: Arc::new(Mutex::new(None)),
         };
-        result.start_counter_task(counter_rx);
 
         result
     }
@@ -54,23 +63,6 @@ impl BiggestFileSearcherImpl {
     async fn add_path_to_search(&mut self, path: PathBuf) {
         self.counter_tx.send(1).await.expect("Failed to send counter");
         self.paths_tx.send(path).await.expect("Failed to send path");
-    }
-
-    fn start_counter_task(&self, mut counter_rx: mpsc::Receiver<isize>) {
-        let paths_tx = self.paths_tx.clone();
-        let file_size_tx = self.file_size_tx.clone();
-        tokio::spawn(async move {
-            let mut counter = 0;
-            while let Some(value) = counter_rx.recv().await {
-                counter += value;
-                println!("Counter: {}", counter);
-                if counter == 0 {
-                    paths_tx.close();
-                    file_size_tx.closed().await;
-                    break;
-                }
-            }
-        });
     }
 }
 
@@ -81,7 +73,7 @@ impl BiggestFileSearcher {
         Self { arc }
     }
 
-    pub async fn biggest_file(&self) -> Option<FileSize> {
+    pub async fn biggest_file(&self) -> Option<FileSizeStruct> {
         println!("biggest_file: Taking read lock");
         let searcher = self.arc.read().await;
         let biggest_file = searcher.biggest_file.lock().await;
@@ -89,7 +81,43 @@ impl BiggestFileSearcher {
         biggest_file.clone()
     }
 
-    async fn find_the_biggest_file(&mut self, path: String) -> Result<(), Box<dyn std::error::Error>> {
+    async fn find_the_biggest_file(&mut self, path: String) -> () {
+        let arc_clone = self.arc.clone();
+
+        let path = PathBuf::from(path);
+        tokio::spawn(async move { arc_clone.write().await.add_path_to_search(path).await; });
+
+        for _ in 0..BiggestFileSearcherImpl::MAX_DOP {
+            self.start_file_searcher_worker().await;
+        }
+
+        self.start_counter_task().await;
+    }
+
+    async fn start_counter_task(&self) {
+        let searcher = self.arc.read().await;
+        let paths_tx = searcher.paths_tx.clone();
+        let file_size_tx = searcher.file_size_tx.clone();
+        let counter_rx_mutex = searcher.counter_rx.clone();
+        drop(searcher);
+        let mut counter = 0;
+        while let Some(value) = counter_rx_mutex.lock().await.recv().await {
+            counter += value;
+            println!("Counter: {}", counter);
+            if counter == 0 {
+                println!("Counter task finishing");
+                paths_tx.close();
+                println!("Counter task waiting for file_size_tx to close");
+                file_size_tx.send(Finished).await.expect("Failed to send Finished");
+                file_size_tx.closed().await;
+                println!("Counter task breaking");
+                break;
+            };
+        };
+        println!("Counter task finished");
+    }
+
+    async fn start_file_searcher_worker(&mut self) {
         println!("find_the_biggest_file: Taking read lock");
         let searcher = self.arc.read().await;
         let counter_tx = searcher.counter_tx.clone();
@@ -97,11 +125,6 @@ impl BiggestFileSearcher {
         let file_size_tx = searcher.file_size_tx.clone();
         drop(searcher);
         println!("find_the_biggest_file: Releasing read lock");
-
-        let arc = self.arc.clone();
-
-        let path = PathBuf::from(path);
-        tokio::spawn(async move { arc.write().await.add_path_to_search(path).await; });
 
         let arc = self.arc.clone();
         tokio::spawn(async move {
@@ -119,19 +142,15 @@ impl BiggestFileSearcher {
                         continue;
                     }
 
-                    let file_size = FileSize {
+                    let file_size = FileSizeStruct {
                         size: entry.metadata().await.unwrap().len(),
                         path: entry.path().to_str().unwrap().to_string(),
                     };
-                    file_size_tx.send(file_size).await.expect("Failed to send file size");
-
+                    file_size_tx.send(FileSize(file_size)).await.expect("Failed to send file size");
                 }
                 counter_tx.send(-1).await.expect("Failed to send counter");
             }
-        }).await.expect("Failed to spawn task");
-
-
-        Ok(())
+        });
     }
 
     async fn receive_file_size(&self) {
@@ -142,21 +161,24 @@ impl BiggestFileSearcher {
         println!("receive_file_size: Releasing read lock");
         tokio::spawn(async move {
             let mut file_size_rx = file_size_rx_arc.lock().await;
-            loop {
-                let file_size = match file_size_rx.recv().await {
-                    Some(file_size) => file_size,
-                    None => break,
-                };
-
-                println!("receive_file_size: File size: {:?}, File path: {:?}", file_size.size, file_size.path);
-
-                let mut biggest_file_mutex = biggest_file_arc.lock().await;
-                if let Some(biggest_file) = &*biggest_file_mutex {
-                    if file_size.size > biggest_file.size {
-                        *biggest_file_mutex = Some(file_size);
+            while let Some(message) = file_size_rx.recv().await {
+                 match message {
+                    FileSize(file_size) => {
+                        println!("receive_file_size: File size: {:?}, File path: {:?}", file_size.size, file_size.path);
+                        let mut biggest_file_mutex = biggest_file_arc.lock().await;
+                        if let Some(biggest_file) = &*biggest_file_mutex {
+                            if file_size.size > biggest_file.size {
+                                *biggest_file_mutex = Some(file_size);
+                            }
+                        } else {
+                            *biggest_file_mutex = Some(file_size);
+                        }
                     }
-                } else {
-                    *biggest_file_mutex = Some(file_size);
+                    Finished => {
+                        println!("receive_file_size: Finished");
+                        file_size_rx.close();
+                        break;
+                    }
                 }
             }
         });
