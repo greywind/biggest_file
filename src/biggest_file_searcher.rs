@@ -17,10 +17,10 @@ enum FileSizeMessage {
     Finished,
 }
 
-pub async fn find_the_biggest_file(path: String) -> Result<FileSizeStruct, Box<dyn std::error::Error>> {
+pub async fn find_the_biggest_file(paths: &[String]) -> Result<FileSizeStruct, Box<dyn std::error::Error>> {
     let mut searcher = BiggestFileSearcher::new();
     searcher.receive_file_size().await;
-    searcher.find_the_biggest_file(path).await;
+    searcher.find_the_biggest_file(paths).await;
     match searcher.biggest_file().await {
         Some(file_size) => Ok(file_size),
         None => Err("No files found".into()),
@@ -46,7 +46,7 @@ impl BiggestFileSearcherImpl {
     fn new() -> Self {
         let (paths_tx, paths_rx) = async_channel::unbounded();
         let (file_size_tx, file_size_rx) = mpsc::channel(BiggestFileSearcherImpl::MAX_DOP);
-        let (counter_tx, counter_rx) = mpsc::channel(BiggestFileSearcherImpl::MAX_DOP + 1);
+        let (counter_tx, counter_rx) = mpsc::channel(BiggestFileSearcherImpl::MAX_DOP);
         let result = Self {
             paths_tx,
             paths_rx,
@@ -81,11 +81,12 @@ impl BiggestFileSearcher {
         biggest_file.clone()
     }
 
-    async fn find_the_biggest_file(&mut self, path: String) -> () {
-        let arc_clone = self.arc.clone();
-
-        let path = PathBuf::from(path);
-        tokio::spawn(async move { arc_clone.write().await.add_path_to_search(path).await; });
+    async fn find_the_biggest_file(&mut self, paths: &[String]) -> () {
+        let mut searcher = self.arc.write().await;
+        for path in paths {
+            searcher.add_path_to_search(PathBuf::from(path)).await;
+        }
+        drop(searcher);
 
         for _ in 0..BiggestFileSearcherImpl::MAX_DOP {
             self.start_file_searcher_worker().await;
