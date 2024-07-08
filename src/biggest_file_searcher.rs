@@ -1,9 +1,8 @@
+use std::io::{stdout, Stdout, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
-
 use tokio::sync::{mpsc, Mutex};
-
 use crate::biggest_file_searcher::FileSizeMessage::{FileSize, Finished};
 
 #[derive(Clone)]
@@ -12,8 +11,19 @@ pub struct FileSizeStruct {
     pub size: u64,
 }
 
+enum CounterMessage {
+    DirectoryAdded,
+    DirectoryFinished,
+}
+
 enum FileSizeMessage {
     FileSize(FileSizeStruct),
+    Finished,
+}
+
+enum OutputMessage {
+    Counter(usize, usize),
+    BiggestFile(FileSizeStruct),
     Finished,
 }
 
@@ -30,7 +40,8 @@ struct BiggestFileSearcher {
     paths_tx: async_channel::Sender<PathBuf>,
     paths_rx: async_channel::Receiver<PathBuf>,
     file_size_tx: mpsc::Sender<FileSizeMessage>,
-    counter_tx: mpsc::Sender<isize>,
+    counter_tx: mpsc::Sender<CounterMessage>,
+    output_tx: mpsc::Sender<OutputMessage>,
     biggest_file: Arc<Mutex<Option<FileSizeStruct>>>,
 }
 
@@ -40,21 +51,24 @@ impl BiggestFileSearcher {
         let (paths_tx, paths_rx) = async_channel::unbounded();
         let (file_size_tx, file_size_rx) = mpsc::channel(BiggestFileSearcher::MAX_DOP);
         let (counter_tx, counter_rx) = mpsc::channel(BiggestFileSearcher::MAX_DOP);
+        let (output_tx, output_rx) = mpsc::channel(BiggestFileSearcher::MAX_DOP + 2);
         let result = Self {
             paths_tx,
             paths_rx,
             file_size_tx,
             counter_tx,
+            output_tx,
             biggest_file: Arc::new(Mutex::new(None)),
         };
         result.start_counter_task(counter_rx);
         result.start_receive_file_size_worker(file_size_rx);
+        result.start_output_worker(output_rx);
 
         result
     }
 
-    async fn add_path_to_search(path: PathBuf, paths_tx: async_channel::Sender<PathBuf>, counter_tx: mpsc::Sender<isize>) {
-        counter_tx.send(1).await.expect("Failed to send counter");
+    async fn add_path_to_search(path: PathBuf, paths_tx: async_channel::Sender<PathBuf>, counter_tx: mpsc::Sender<CounterMessage>) {
+        counter_tx.send(CounterMessage::DirectoryAdded).await.expect("Failed to send counter");
         paths_tx.send(path).await.expect("Failed to send path");
     }
 
@@ -78,46 +92,47 @@ impl BiggestFileSearcher {
         }
     }
 
-    fn start_counter_task(&self, mut counter_rx: mpsc::Receiver<isize>) {
+    fn start_counter_task(&self, mut counter_rx: mpsc::Receiver<CounterMessage>) {
         let paths_tx = self.paths_tx.clone();
         let file_size_tx = self.file_size_tx.clone();
+        let output_tx = self.output_tx.clone();
         tokio::spawn(async move {
-            let mut counter = 0;
+            let mut total = 0;
+            let mut finished = 0;
             while let Some(value) = counter_rx.recv().await {
-                counter += value;
-                println!("Counter: {}", counter);
-                if counter == 0 {
-                    println!("Counter task finishing");
+                match value {
+                    CounterMessage::DirectoryAdded => {
+                        total += 1;
+                    }
+                    CounterMessage::DirectoryFinished => {
+                        finished += 1;
+                    }
+                }
+                output_tx.send(OutputMessage::Counter(finished, total)).await.expect("Failed to send counter to output");
+                if total == finished {
                     paths_tx.close();
-                    println!("Counter task waiting for file_size_tx to close");
                     file_size_tx.send(Finished).await.expect("Failed to send Finished");
                     file_size_tx.closed().await;
-                    println!("Counter task breaking");
+                    output_tx.send(OutputMessage::Finished).await.expect("Failed to send Finished to output");
+                    output_tx.closed().await;
                     break;
                 };
             };
-            println!("Counter task finished");
         });
     }
 
     fn start_file_searcher_worker(&self) -> tokio::task::JoinHandle<()> {
-        println!("find_the_biggest_file: Taking read lock");
         let counter_tx = self.counter_tx.clone();
         let paths_rx = self.paths_rx.clone();
         let paths_tx = self.paths_tx.clone();
         let file_size_tx = self.file_size_tx.clone();
-        println!("find_the_biggest_file: Releasing read lock");
 
         let join_handle = tokio::spawn(async move {
             while let Ok(path) = paths_rx.recv().await {
-                println!("find_the_biggest_file: Received path: {:?}", path.to_str().unwrap());
                 let mut read_dir = tokio::fs::read_dir(path.deref()).await.unwrap();
                 while let Some(entry) = read_dir.next_entry().await.unwrap() {
-                    println!("find_the_biggest_file: Entry: {:?}", entry.path().to_str().unwrap());
-
                     let file_type = entry.file_type().await.unwrap();
                     if file_type.is_dir() {
-                        println!("find_the_biggest_file: Adding path to search: {:?}", entry.path());
                         Self::add_path_to_search(entry.path(), paths_tx.clone(), counter_tx.clone()).await;
                         continue;
                     }
@@ -133,7 +148,7 @@ impl BiggestFileSearcher {
                     };
                     file_size_tx.send(FileSize(file_size)).await.expect("Failed to send file size");
                 }
-                counter_tx.send(-1).await.expect("Failed to send counter");
+                counter_tx.send(CounterMessage::DirectoryFinished).await.expect("Failed to send counter");
             }
         });
 
@@ -141,29 +156,85 @@ impl BiggestFileSearcher {
     }
 
     fn start_receive_file_size_worker(&self, mut file_size_rx: mpsc::Receiver<FileSizeMessage>) {
-        println!("receive_file_size: Taking read lock");
         let biggest_file_arc = self.biggest_file.clone();
-        println!("receive_file_size: Releasing read lock");
+        let output_tx = self.output_tx.clone();
         tokio::spawn(async move {
             while let Some(message) = file_size_rx.recv().await {
-                 match message {
+                match message {
                     FileSize(file_size) => {
-                        println!("receive_file_size: File size: {:?}, File path: {:?}", file_size.size, file_size.path);
                         let mut biggest_file_mutex = biggest_file_arc.lock().await;
                         if let Some(biggest_file) = &*biggest_file_mutex {
-                            if file_size.size > biggest_file.size {
-                                *biggest_file_mutex = Some(file_size);
+                            if file_size.size <= biggest_file.size {
+                                continue;
                             }
-                        } else {
-                            *biggest_file_mutex = Some(file_size);
                         }
+
+                        let file_size_clone = file_size.clone();
+                        *biggest_file_mutex = Some(file_size);
+                        output_tx.send(OutputMessage::BiggestFile(file_size_clone)).await.expect("Failed to send biggest file to output");
                     }
                     Finished => {
-                        println!("receive_file_size: Finished");
                         file_size_rx.close();
                         break;
                     }
                 }
+            }
+        });
+    }
+
+    fn start_output_worker(&self, mut output_rx: mpsc::Receiver<OutputMessage>) {
+        tokio::spawn(async move {
+            struct State {
+                finished: usize,
+                total: usize,
+                biggest_file: Option<FileSizeStruct>,
+            }
+            let mut state = State {
+                finished: 0,
+                total: 0,
+                biggest_file: None,
+            };
+
+            let mut stdout = stdout();
+
+            fn clear_output(t: &mut Stdout, state: &State) {
+                if state.total == 0 {
+                    return;
+                }
+
+                let lines = if state.biggest_file.is_none() { 1 } else { 2 };
+                for _ in 0..lines {
+                    t.write_all("\x1B[1A\x1B[2K".as_bytes()).unwrap();
+                }
+            }
+
+            fn output(t: &mut Stdout, state: &State) {
+                if state.total == 0 {
+                    return;
+                }
+
+                t.write_fmt(format_args!("{}/{} ({}%)\n", state.finished, state.total, (state.finished as f32 / state.total as f32 * 100.0).floor())).unwrap();
+                if let Some(biggest_file) = &state.biggest_file {
+                    t.write_fmt(format_args!("Biggest file: '{}' with size: {} bytes\n", biggest_file.path, biggest_file.size)).unwrap();
+                }
+            }
+
+            while let Some(message) = output_rx.recv().await {
+                clear_output(&mut stdout, &state);
+                match message {
+                    OutputMessage::Counter(finished, total) => {
+                        state.finished = finished;
+                        state.total = total;
+                    }
+                    OutputMessage::BiggestFile(file_size) => {
+                        state.biggest_file = Some(file_size);
+                    }
+                    OutputMessage::Finished => {
+                        output_rx.close();
+                        break;
+                    }
+                }
+                output(&mut stdout, &state);
             }
         });
     }
